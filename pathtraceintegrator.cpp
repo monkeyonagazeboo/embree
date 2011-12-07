@@ -14,6 +14,8 @@
 // limitations under the License.                                           //
 // ======================================================================== //
 
+#define _CRT_RAND_S
+
 #include "integrators/pathtraceintegrator.h"
 
 namespace embree
@@ -57,7 +59,7 @@ namespace embree
 
     /*! Terminate path if too long or contribution too low. */
 	L = zero;
-    if (lightPath.depth >= maxDepth || reduce_max(lightPath.throughput) < minContribution)
+    if (lightPath.depth >= maxDepth)// || reduce_max(lightPath.throughput) < minContribution)
 		return Lsum;
 
     /*! Traverse ray. */
@@ -134,6 +136,8 @@ namespace embree
       }
     }
 	
+	/* Add the resulting light */
+	Lsum += coeff * L;
 
     /*! Global illumination. Pick one BRDF component and sample it. */
     if (lightPath.depth < maxDepth) //always true
@@ -143,7 +147,7 @@ namespace embree
       Vec2f s  = sampler->getVec2f(firstScatterSampleID     + lightPath.depth);
       float ss = sampler->getFloat(firstScatterTypeSampleID + lightPath.depth);
       Col3f c = brdfs.sample(wo, dg, wi, type, s, ss, giBRDFTypes);
-
+	  
       /*! Continue only if we hit something valid. */
       if (c != Col3f(zero) && wi.pdf > 0.0f)
       {
@@ -157,9 +161,15 @@ namespace embree
 
         /*! Continue the path. */
         //const LightPath scatteredPath = lightPath.extended(Ray(dg.P, wi, dg.error*epsilon, inf), nextMedium, c, (type & directLightingBRDFTypes) != NONE);
-        Lsum += coeff * L;
+        /* Pr(ray absorbtion) */
+		float q = q = min(abs(reduce_max(c) * rcp(wi.pdf)), (float)1);
+		unsigned int RndVal;
+		if (rand_s(&RndVal)) std::cout << "\nRND gen error!\n";
+		if ((float)RndVal/(float)UINT_MAX > q)
+			return Lsum;// + L*coeff;
+		//Lsum += coeff * L;
 		lightPath = lightPath.extended(Ray(dg.P, wi, dg.error*epsilon, inf), nextMedium, c, (type & directLightingBRDFTypes) != NONE);
-		coeff = coeff * c * rcp(wi.pdf);
+		coeff = coeff * c * rcp(q * wi.pdf);
 		//done = true;
       }else done = true;
     }
