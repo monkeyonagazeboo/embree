@@ -187,9 +187,8 @@ namespace embree
 		    weight = mis(wi.pdf, pdflight);
 		    if (typeid(Obj) == typeid(*dg.material) && !(type && SPECULAR)) weight = 1.0f;
         
-        if ( dot( diff.Ng, -r.dir ) > 0 && lightPath.depth < 1)	
+        if ( dot( diff.Ng, -r.dir ) > 0)	
 	        L += radiance * c * weight / wi.pdf;
-          // L += radiance * weight / wi.pdf;
       }
 
 		/*! Run through all the lightsources and sample or compute the distribution function for rnd gen */
