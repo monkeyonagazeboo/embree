@@ -14,9 +14,11 @@
 // limitations under the License.                                           //
 // ======================================================================== //
 
-#define _CRT_RAND_S
+#define _CRT_RAND_S  
 
 #include "integrators/pathtraceintegrator.h"
+#include "renderer/materials/obj.h"
+#include <typeinfo>
 
 namespace embree
 { 
@@ -28,6 +30,39 @@ namespace embree
     epsilon         = parms.getFloat("epsilon"        ,128.0f)*float(ulp);
     backplate       = parms.getImage("backplate");
   }
+
+  float mis ( float pdf1, float pdf2 )
+    {
+      return pdf1 / (pdf1 + pdf2);
+    }
+    
+    __forceinline Col3f BRDF_sample(const Ref<BackendScene>& scene, Col3f c, DifferentialGeometry dg,const Sample3f wi, float epsilon)
+    {
+      if (wi.pdf <= 0.0f)
+        return zero;
+      
+      Ray r( dg.P, wi.value, dg.error*epsilon, inf );
+      DifferentialGeometry diff;
+      scene->accel->intersect( r, diff );
+      scene->postIntersect( r, diff );
+
+      Col3f radiance =  Col3f( 0.0f,0.0f,0.0f );
+      float pdflight = 0.0f;
+      if ( diff.light  )
+      {
+	      radiance = diff.light->Le(diff, -wi.value );
+	      pdflight = diff.light->pdf( dg, wi );
+      }
+      float weight = mis(wi.pdf, pdflight);
+      if ( dot( diff.Ng, -r.dir ) > 0 )
+      return radiance * c * weight / wi.pdf;
+    }
+    
+    __forceinline Col3f LS_sample (const Ref<BackendScene>& scene,const Sample3f wo, DifferentialGeometry dg,const Sample3f wi, BRDFType giBRDFTypes, CompositedBRDF brdfs,
+    Sampler* sampler, int lightSampleID)
+    {
+      return zero;
+    }
 
   void PathTraceIntegrator::requestSamples(Ref<SamplerFactory>& samplerFactory, const Ref<BackendScene>& scene)
   {
@@ -52,6 +87,9 @@ namespace embree
 	  LightPath lightPath = lightPathOrig;
     bool doneDiffuse = false;
 
+    /*! while cycle instead of the recusrion call 
+    * throughput is accumulated and the resulting light addition is 
+    * multipliled by this throughput (coef) at each itteration */
 	  while (!done)
 	  {
 
@@ -59,11 +97,11 @@ namespace embree
     BRDFType giBRDFTypes = (BRDFType)(ALL);
 
     /*! Terminate path if too long or contribution too low. */
-	L = zero;
+    L = zero;
+
+    /*! Terminate the path if maxDepth is reached */
     if (lightPath.depth >= maxDepth) // || reduce_max(coeff) < minContribution)
       return Lsum;
-
-    //std::cout << maxDepth << "\n";
 
     /*! Traverse ray. */
     DifferentialGeometry dg;
@@ -107,6 +145,13 @@ namespace embree
     }
 #endif
 
+    /*! Sample BRDF - get the sample direction for
+    * both the indirect illumination as well as for the MIS BRDF sampling */
+    Col3f c; Sample3f wi;BRDFType type;
+    Vec2f s  = sampler->getVec2f(firstScatterSampleID     + lightPath.depth);
+    float ss = sampler->getFloat(firstScatterTypeSampleID + lightPath.depth);
+    c = brdfs.sample(wo, dg, wi, type, s, ss, giBRDFTypes);
+
     /*! Add light emitted by hit area light source. */
     if (!lightPath.ignoreVisibleLights && dg.light && !backfacing)
       L += dg.light->Le(dg,wo);
@@ -116,93 +161,109 @@ namespace embree
     for (size_t i=0; i<brdfs.size(); i++)
       useDirectLighting |= (brdfs[i]->type & directLightingBRDFTypes) != NONE;
 
-    /*! Direct lighting. Shoot shadow rays to all light sources. */
-       if (useDirectLighting)
+    /*! Direct lighting. */
+    if (useDirectLighting)
     {
-		std::vector<float> accumRad;
-		float sum = 0;
-		
+		  std::vector<float> illumFactor;  // illumination factor for each ls
+      float sum = 0;
+      LightSample ls;
+      float weight = 1.0f;
+
+		  if ( wi.pdf > 0.0f )
+	    {
+		    Ray r( dg.P, wi.value, dg.error*epsilon, inf );
+		    DifferentialGeometry diff;
+		    scene->accel->intersect( r, diff );
+		    scene->postIntersect( r, diff );
+
+		    Col3f red = Col3f( 1.0f, 0.0f, 0.0f);
+		    Col3f radiance =  Col3f( 0.0f,0.0f,0.0f );
+		    float pdflight = 0.0f;
+		    if ( diff.light  ) // if BRDF sampling hits the light
+		    {
+		      radiance = diff.light->Le(diff, -wi.value );
+		      pdflight = diff.light->pdf( dg, wi );
+		    }
+		    weight = mis(wi.pdf, pdflight);
+		    if (typeid(Obj) == typeid(*dg.material) && !(type && SPECULAR)) weight = 1.0f;
+        
+        if ( dot( diff.Ng, -r.dir ) > 0 && lightPath.depth < 1)	
+	        L += radiance * c * weight / wi.pdf;
+          // L += radiance * weight / wi.pdf;
+      }
+
 		/*! Run through all the lightsources and sample or compute the distribution function for rnd gen */
 		for (size_t i=0; i<scene->allLights.size(); i++)
       {
         /*! Either use precomputed samples for the light or sample light now. */
-        LightSample ls;
         if (scene->allLights[i]->precompute()) ls = sampler->getLightSample(precomputedLightSampleID[i]);
         else ls.L = scene->allLights[i]->sample(dg, ls.wi, ls.tMax, sampler->getVec2f(lightSampleID));
 
-		/*! Start using only one random lightsource after first Lambertian reflection */
-		if (doneDiffuse)//donedif
-		{
-			/*! run through all the lighsources and compute radiance accumulatively */
-      float boo = reduce_max(ls.L)/ls.tMax;//reduce_max(scene->allLights[i]->eval(dg,ls.wi));
-      sum += boo;
-			accumRad.push_back(boo);
-      //std::cout << "\nrad" << boo;
-		}
-		else
-		{
-			/*! Ignore zero radiance or illumination from the back. */
-			if (ls.L == Col3f(zero) || ls.wi.pdf == 0.0f || dot(dg.Ns,Vec3f(ls.wi)) <= 0.0f) continue;
+		    /*! Start using only one random lightsource after first Lambertian reflection
+        * in case of the direct illumination MIS this heuristics is ommited */ 
+		    if (true)//donedif
+		    {
+			    /*! run through all the lighsources and compute radiance accumulatively */
+          float boo = reduce_max(ls.L)/ls.tMax;  // incomming illuminance heuristic
+          sum += boo;
+			    illumFactor.push_back(boo);  // illumination factor
+		    }
+		    else  // if all the lights are sampled - take each sample and compute the addition
+		    {
+			    /*! Ignore zero radiance or illumination from the back. */
+			    if (ls.L == Col3f(zero) || ls.wi.pdf == 0.0f || dot(dg.Ns,Vec3f(ls.wi)) <= 0.0f) continue;
 
-			/*! Test for shadows. */
-			bool inShadow = scene->accel->occluded(Ray(dg.P, ls.wi, dg.error*epsilon, ls.tMax-dg.error*epsilon));
-			numRays++;
-			if (inShadow) continue;
+			    /*! Test for shadows. */
+			    bool inShadow = scene->accel->occluded(Ray(dg.P, ls.wi, dg.error*epsilon, ls.tMax-dg.error*epsilon));
+			    numRays++;
+			    if (inShadow) continue;
 
-			/*! Evaluate BRDF. */
-			L += ls.L * brdfs.eval(wo, dg, ls.wi, directLightingBRDFTypes) * rcp(ls.wi.pdf);
-		}
+			    /*! Evaluate BRDF. */
+			    L += ls.L * brdfs.eval(wo, dg, ls.wi, directLightingBRDFTypes) * rcp(ls.wi.pdf);
+		    }
       }
 
-	  /*! After fisrt Lambertian reflection pick one random lightsource and compute contribution */
-	  if (doneDiffuse && scene->allLights.size() != 0)//donedif
+	  /*! After fisrt Lambertian reflection pick one random lightsource and compute contribution
+    * in case of MIS active this heuristic is ommited */
+	  if (true && scene->allLights.size() != 0)//donedif
 	  {
 		  /*! Generate the random value */
-		  unsigned int RndVal;
-		  if (rand_s(&RndVal)) std::cout << "\nRND gen error!\n";
-		  float rnd((float)RndVal/(float)UINT_MAX);
+		  unsigned int RndVal;  // random value
+      if (rand_s(&RndVal)) std::cout << "\nRND gen error!\n";
+		  // rand_r(&RndVal);
+      float rnd((float)RndVal/(float)UINT_MAX);  // compute the 0-1 rnd value
 		  
-		  /*! Pick the particular lightsource according the radiosity-given distribution */
+		  /*! Pick the particular lightsource according the intensity-given distribution */
 		  size_t i = 0; 
-      float accum = accumRad[i]/sum;
-		  while (i < scene->allLights.size() && rnd > accum)
+      float accum = illumFactor[i]/sum;  // accumulative sum
+		  while (i < scene->allLights.size() && rnd > accum)  // get the lightsource index accirding the Pr
       {
 			  ++i;
-        accum +=accumRad[i]/sum;
+        accum +=illumFactor[i]/sum;
       }
-      //std::cout << "\nsvetlo " << i;// << "\n";
-      //std::cout << "\npocet " << scene->allLights.size(); 
-      //std::cout << "\nsuma " << sum; 
-      //std::cout << "\npst preziti " << accumRad[i]/sum;// << "\n";
-      //std::cout << "\n1/pst preziti " << rcp(accumRad[i]/sum) << "\n";
 
 		  /*! Sample the selected lightsource and compute contribution */
 		  if ( i >= scene->allLights.size() ) i = scene->allLights.size() -1;
-      float ql = accumRad[i]/sum;
-		  LightSample ls;
-		  if (scene->allLights[i]->precompute()) ls = sampler->getLightSample(precomputedLightSampleID[i]);
-		  else ls.L = scene->allLights[i]->sample(dg, ls.wi, ls.tMax, sampler->getVec2f(lightSampleID));
+      // if (usedLight != NULL)
+      // std::cout << "direct light " << scene->allLights[i].ptr << "\n";
+        float ql = illumFactor[i]/sum;  // Pr of given lightsource
+		    // LightSample ls;
+		    if (scene->allLights[i]->precompute()) ls = sampler->getLightSample(precomputedLightSampleID[i]);
+		    else ls.L = scene->allLights[i]->sample(dg, ls.wi, ls.tMax, sampler->getVec2f(lightSampleID));
 
-		  /*! run through all the lighsources and compute radiance accumulatively */
-		  //sum += reduce_max(scene->allLights[i]->eval(dg,ls.wi));
-		  //accumRad.push_back(sum);
-
-		  /*! Ignore zero radiance or illumination from the back. */
-		  //if (ls.L == Col3f(zero) || ls.wi.pdf == 0.0f || dot(dg.Ns,Vec3f(ls.wi)) <= 0.0f) continue;
-		  if (ls.L != Col3f(zero) && ls.wi.pdf != 0.0f && dot(dg.Ns,Vec3f(ls.wi)) > 0.0f) 
-		  {
-        /*! Ignore zero radiance or illumination from the back. */
-			  // if (ls.L == Col3f(zero) || ls.wi.pdf == 0.0f || dot(dg.Ns,Vec3f(ls.wi)) <= 0.0f) continue;
-
-			  /*! Test for shadows. */
-			  bool inShadow = scene->accel->occluded(Ray(dg.P, ls.wi, dg.error*epsilon, ls.tMax-dg.error*epsilon));
-			  numRays++;
-			  if (!inShadow) 
-
-				  /*! Evaluate BRDF. */
-				  L += ls.L * brdfs.eval(wo, dg, ls.wi, directLightingBRDFTypes) * rcp(ls.wi.pdf*ql);
-   
-		  }
+		    /*! Ignore zero radiance or illumination from the back. */
+		    if (ls.L != Col3f(zero) && ls.wi.pdf != 0.0f && dot(dg.Ns,Vec3f(ls.wi)) > 0.0f) 
+		    {
+			    /*! Test for shadows. */
+			    bool inShadow = scene->accel->occluded(Ray(dg.P, ls.wi, dg.error*epsilon, ls.tMax-dg.error*epsilon));
+			    numRays++;
+			    if (!inShadow) 
+			    {
+				    weight = mis( ls.wi.pdf, brdfs.pdf( wo, dg, wi, giBRDFTypes ) );
+				    /*! Evaluate BRDF. */
+				    L += ls.L * brdfs.eval(wo, dg, ls.wi, directLightingBRDFTypes) * rcp(ls.wi.pdf*ql) * weight;
+			    }
+        }
 	  }
     }
 	
@@ -212,12 +273,6 @@ namespace embree
     /*! Global illumination. Pick one BRDF component and sample it. */
     if (lightPath.depth < maxDepth) //always true
     {
-      /*! sample brdf */
-      Sample3f wi; BRDFType type;
-      Vec2f s  = sampler->getVec2f(firstScatterSampleID     + lightPath.depth);
-      float ss = sampler->getFloat(firstScatterTypeSampleID + lightPath.depth);
-      Col3f c = brdfs.sample(wo, dg, wi, type, s, ss, giBRDFTypes);
-	  
       /*! Continue only if we hit something valid. */
       if (c != Col3f(zero) && wi.pdf > 0.0f)
       {
@@ -233,30 +288,24 @@ namespace embree
         if (type & TRANSMISSION) nextMedium = dg.material->nextMedium(lightPath.lastMedium);
 
         /*! Continue the path. */
-        //const LightPath scatteredPath = lightPath.extended(Ray(dg.P, wi, dg.error*epsilon, inf), nextMedium, c, (type & directLightingBRDFTypes) != NONE);
-        /* Pr(ray absorbtion) */
-		float q = 1;
-    if (doneDiffuse) { //std::cout << "\ndifusni\n";
-      q = min(abs(reduce_max(c) * rcp(wi.pdf)), (float)1);
-      // std::cout << q << "\n";
-      unsigned int RndVal;
-      if (rand_s(&RndVal)) std::cout << "\nRND gen error!\n";
-      if ((float)RndVal/(float)UINT_MAX > q) { // std::cout << "konec";
-        return Lsum;// + L*coeff;
-      }
+		    float q = 1;
+        if (doneDiffuse) { //std::cout << "\ndifusni\n";
+          q = min(abs(reduce_max(c) * rcp(wi.pdf)), (float)1);
+          // std::cout << q << "\n";
+          unsigned int RndVal;
+          if (rand_s(&RndVal)) std::cout << "\nRND gen error!\n";
+          // rand_r(&RndVal);
+          if ((float)RndVal/(float)UINT_MAX > q) { // std::cout << "konec";
+            return Lsum;// + L*coeff;
+          }
+        }
+        /*! Continue the path */
+		    lightPath = lightPath.extended(Ray(dg.P, wi, dg.error*epsilon, inf), nextMedium, c, (type & directLightingBRDFTypes) != NONE);
+		    coeff = coeff * c * rcp(q * wi.pdf);
+      }else done = true;   // end the path
     }
-		//Lsum += coeff * L;
-		lightPath = lightPath.extended(Ray(dg.P, wi, dg.error*epsilon, inf), nextMedium, c, (type & directLightingBRDFTypes) != NONE);
-		coeff = coeff * c * rcp(q * wi.pdf);
-		//done = true;
-      }else done = true;
-    }
-
   }
-
-  
-
-  return Lsum;// + L * coeff;
+  return Lsum;
   }
 
   Col3f PathTraceIntegrator::Li(const Ray& ray, const Ref<BackendScene>& scene, Sampler* sampler, size_t& numRays) {
