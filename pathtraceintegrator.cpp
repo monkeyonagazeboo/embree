@@ -185,9 +185,8 @@ namespace embree
 		      pdflight = diff.light->pdf( dg, wi );
 		    }
 		    weight = mis(wi.pdf, pdflight);
-		    if (typeid(Obj) == typeid(*dg.material) && !(type && SPECULAR)) weight = 1.0f;
         
-        if ( dot( diff.Ng, -r.dir ) > 0)	
+        if ( dot( diff.Ng, -r.dir ) > 0 && type != GLOSSY_REFLECTION)	
 	        L += radiance * c * weight / wi.pdf;
       }
 
